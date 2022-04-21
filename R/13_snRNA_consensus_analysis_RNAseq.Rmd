@@ -1,0 +1,348 @@
+---
+title: "snRNA mapping"
+output: html_notebook
+---
+
+Make bowtie2 index:
+
+```{bash}
+cd /tungstenfs/scratch/gbuehler/michi/Annotations/Bowtie2/snRNA_consensus2
+module load Bowtie2/2.3.5.1-GCC-8.3.0
+bowtie2-build -f snRNA_consensus.fa snRNA_consensus
+```
+
+
+Map using bowtie2, using non-collapsed data, `_noComp_noLCstrip.prinseq.fasta` made from the pipeline `CRAC_pipeline_v2.sh`.
+
+```{bash}
+cd /tungstenfs/nobackup/gbuehler/michi/Projects/Nrde2/RNAseq
+mkdir bowtie2_snRNA_read_distribution
+cd bowtie2_snRNA_read_distribution
+cp /work/gbioinfo/deepSeqRepos/raw_temp/srf_BSSE/2701F*_R1_001.fastq.gz .
+rm *Undetermined*
+
+module load Bowtie2
+for f in 2701F*_R1_001.fastq.gz ; do ( nice nohup bowtie2 --sensitive -q -x /tungstenfs/scratch/gbuehler/michi/Annotations/Bowtie2/snRNA_consensus2/snRNA_consensus.fa -S ${f%_R1_001.fastq.gz}_snRNAv2.sam -U $f -p 20 ) ; done
+module purge
+```
+
+Only taking reads 20 bp or more, and matches with <=1 edit distance (and remove stupid @ at start of read name!): (skip)
+
+```{bash}
+for f in *_snRNAv2.sam ; do (cat $f | awk 'BEGIN{FS="\t"; OFS="\t"} /^@[HSP]/{print} (/NM:i:0/||/NM:i:1/){match($6,/M/); size = substr($6,1,RSTART-1); if (int(size) > 19) {print substr($0,2)}} {size = 0}' > ${f%.sam}_20ntOrLongerPerfectMatches.sam & ) ; done
+```
+
+Convert to BAM
+
+```{bash}
+module load SAMtools
+for f in *_snRNAv2.sam ; do ( (samtools view -b $f > ${f%.sam}.bam ; samtools sort ${f%.sam}.bam > ${f%.sam}-sorted.bam ; samtools index ${f%.sam}-sorted.bam & ) & ) ; done
+```
+
+Count depth:
+
+```{bash}
+for f in *_snRNAv2-sorted.bam ; do ( nohup samtools depth -d 1000000000 -a $f > ${f%-sorted.bam}_snRNAv2_pileup.txt & ) ; done
+```
+
+Normalise to max depth (= 100) => max is 999.00; also pad field to width of 6, and include 2 digits after the decimal point:
+
+```
+for f in *_snRNAv2_pileup.txt ; do ( awk 'BEGIN{FS="\t"; OFS="\t"; maxval=0} NR==FNR&&$3>maxval{maxval=$3} NR!=FNR{$3=999*$3/maxval; printf "%s\t%i\t%6.2f\n", $1, $2, $3}' $f $f > ${f%.txt}_NormAndPadded.txt) ; done
+```
+# count total number of reads in fasta file
+
+```{bash}
+gunzip *.fastq.gz
+for f in *.fastq ; do ( wc -l $f > ${f%_R1_001.fastq}_reads.txt ); done
+
+rm *.fastq
+rm *.sam
+```
+
+
+# Plot the coverage in R
+
+```{r}
+library(tidyverse)
+library(wesanderson)
+
+setwd("/tungstenfs/nobackup/gbuehler/michi/Projects/Nrde2/")
+
+files <- list.files("/tungstenfs/nobackup/gbuehler/michi/Projects/Nrde2/RNAseq/bowtie2_snRNA_read_distribution/",full.names = TRUE, pattern="_snRNAv2_pileup.txt")[1:4]
+
+
+
+filenames <- c("WT_r1","WT_r2","SmE_r1","SmE_r2")
+
+
+
+D <- read.table(files[1])
+D$ID <- paste(D$V1,D$V2,sep="_")
+D <- D[,c(4,1:3)]
+for (i in 2:length(filenames)){
+   D2<- read.table(files[i])
+   D2$ID <- paste(D2$V1,D2$V2,sep="_")
+   D <- full_join(D,D2[,3:4],by="ID")
+}
+colnames(D) <- c("ID","RNA","position",filenames)
+D2 <- pivot_longer(D,cols=filenames,names_to = "sample",values_to = "score")
+D2$score <- replace_na(D2$score,0)
+#remove positions > 14000 as no reads seem to map tehre anyways
+#D3 <- filter(D2,position <= 14000)
+
+#normalize to total number of reads in fasta files
+
+#read in read counts
+read.count.files <- list.files("/tungstenfs/nobackup/gbuehler/michi/Projects/Nrde2/RNAseq/bowtie2_snRNA_read_distribution/",full.names = TRUE, pattern="reads.txt")[1:4]
+#read.count.files <- list.files("/tungstenfs/scratch/gbuehler/michi/Projects/Nrde2/BCLIP/experiment4",full.names = TRUE, pattern="reads.txt")
+R <- read.table(read.count.files[1])
+for (i in 2:length(read.count.files)){
+   R2<- read.table(read.count.files[i])
+   R <- rbind(R,R2)
+}
+R$sample <- filenames
+R$reads <- R$V1/4
+#calculate norm factor
+R$norm.factor <- R$reads/1000000
+
+#divide by norm factor to get cpm
+D2 <- left_join(D2,R[,3:5],by="sample")
+D2$cpm <- D2$score/D2$norm.factor
+
+
+#define colors
+plotcols <- c("#de2d26","#de2d26","#2ca25f","#2ca25f")
+
+
+ggplot(D2,aes(x=position,y=cpm,col=sample)) + geom_line() +
+   scale_color_manual(values=plotcols) + theme_classic() + facet_wrap(vars(RNA))
+
+ggsave("/tungstenfs/nobackup/gbuehler/michi/Projects/Nrde2/Figures/snRNAv2_plots_SME_RNAseq_cpm.pdf",device="pdf",height=8, width=16)
+
+ggplot(D2,aes(x=position,y=cpm,col=sample)) + geom_line() +
+   scale_color_manual(values=plotcols) + theme_classic() + facet_wrap(vars(RNA),scales="free")
+
+ggsave("/tungstenfs/nobackup/gbuehler/michi/Projects/Nrde2/Figures/snRNAv2_plots_SME_RNAseq_freescales_cpm.pdf",device="pdf",height=8, width=16)
+
+
+#combine replicates
+D3 <- D2
+D3$group <- gsub("_r1","",D3$sample)
+D3$group <- gsub("_r2","",D3$group)
+#D3$group <- gsub("_1","",D3$sample)
+#D3$group <- gsub("_2","",D3$group)
+unique(D3$group)
+
+D4 <- D3 %>% group_by(RNA,position,group) %>% summarise(gscore = mean(cpm))
+
+plotcols3 <- plotcols[c(5,6,4,1,3,2)]
+ggplot(D4,aes(x=position,y=gscore,col=group)) + geom_line() +
+   scale_color_manual(values=plotcols3) + theme_classic() + facet_wrap(vars(RNA))
+
+ggsave("/tungstenfs/nobackup/gbuehler/michi/Projects/Nrde2/Figures/snRNAv2_groupwise_plots_BCLIP_exp4_cpm.pdf",device="pdf",height=8, width=16)
+
+#split by group
+D3$group <- factor(D3$group, levels=c("Nrde2","Nrde2d200","Nrde2D174R","Mtr4","Ccdc174","Eif4a3"), labels=c("Nrde2","Nrde2d200","Nrde2D174R","Mtr4","Ccdc174","Eif4a3")) 
+#D3$group <- factor(D3$group, levels=c("Ccdc174_Nrde2KO","Nrde2_dTSmE","Nrde2OE","SmE"), labels=c("Ccdc174_Nrde2KO","Nrde2_dTSmE","Nrde2OE","SmE")) 
+
+D3 <- D3[order(D3$group),]
+plotcols3 <- plotcols[c(5,5,6,6,4,4,1,1,3,3,2,2)]
+
+ggplot(D3,aes(x=position,y=cpm,col=sample)) + geom_line() +
+   scale_color_manual(values=plotcols3) + theme_classic() + facet_grid(group ~ RNA,scales="free") 
+
+ggsave("/tungstenfs/nobackup/gbuehler/michi/Projects/Nrde2/Figures/snRNAv2_freefaceted_plots_BCLIP_exp4_cpm.pdf",device="pdf",height=8, width=16)
+```
+
+# combine U1 data
+
+```{r}
+
+#cobine U1 data
+D2$RNA <- gsub("a1","",D2$RNA)
+D2$RNA <- gsub("b1","",D2$RNA)
+D2$RNA <- gsub("b6","",D2$RNA)
+D2 <- D2 %>% group_by(RNA,position,sample) %>% summarise(score = sum(cpm))
+
+#define colors
+plotcols <- c("#046C9A","#5BBCD6","#C6CDF7","#FD6464","#F98400","#00A08A")
+
+plotcols3 <- plotcols[c(5,5,6,6,4,4,1,1,3,3,2,2)]
+
+ggplot(D2,aes(x=position,y=score,col=sample)) + geom_line() +
+   scale_color_manual(values=plotcols3) + theme_classic() + facet_wrap(vars(RNA))
+
+ggsave("/tungstenfs/nobackup/gbuehler/michi/Projects/Nrde2/Figures/snRNAv2_plots_BCLIP_sumU1_v2_cpm.pdf",device="pdf",height=16, width=16)
+
+ggplot(D2,aes(x=position,y=score,col=sample)) + geom_line() +
+   scale_color_manual(values=plotcols3) + theme_classic() + facet_wrap(vars(RNA),scales="free")
+
+ggsave("/tungstenfs/nobackup/gbuehler/michi/Projects/Nrde2/Figures/snRNAv2_plots_BCLIP__sumU1_freescales_v2_cpm.pdf",device="pdf",height=16, width=16)
+
+
+#combine replicates
+D3 <- D2
+D3$group <- gsub("_r1","",D3$sample)
+D3$group <- gsub("_r2","",D3$group)
+#D3$group <- gsub("_1","",D3$sample)
+#D3$group <- gsub("_2","",D3$group)
+unique(D3$group)
+
+D4 <- D3 %>% group_by(RNA,position,group) %>% summarise(gscore = mean(score))
+
+plotcols3 <- plotcols[c(5,6,4,1,3,2)]
+ggplot(D4,aes(x=position,y=gscore,col=group)) + geom_line() +
+   scale_color_manual(values=plotcols3) + theme_classic() + facet_wrap(vars(RNA))
+
+ggsave("/tungstenfs/nobackup/gbuehler/michi/Projects/Nrde2/Figures/snRNAv2_groupwise_plots_BCLIP_sumU1_v2_cpm.pdf",device="pdf",height=16, width=16)
+
+#split by group
+D3$group <- factor(D3$group, levels=c("Nrde2","Nrde2d200","Nrde2D174R","Mtr4","Ccdc174","Eif4a3"), labels=c("Nrde2","Nrde2d200","Nrde2D174R","Mtr4","Ccdc174","Eif4a3")) 
+#D3$group <- factor(D3$group, levels=c("Ccdc174_Nrde2KO","Nrde2_dTSmE","Nrde2OE","SmE"), labels=c("Ccdc174_Nrde2KO","Nrde2_dTSmE","Nrde2OE","SmE")) 
+
+D3 <- D3[order(D3$group),]
+plotcols3 <- plotcols[c(5,5,6,6,4,4,1,1,3,3,2,2)]
+
+ggplot(D3,aes(x=position,y=score,col=sample)) + geom_line() +
+   scale_color_manual(values=plotcols3) + theme_classic() + facet_grid(group ~ RNA,scales="free") 
+
+ggsave("/tungstenfs/nobackup/gbuehler/michi/Projects/Nrde2/Figures/snRNAv2_freefaceted_plots_BCLIP_sumU1_v2_cpm.pdf",device="pdf",height=16, width=16)
+
+#select only U1 OR U6 or U4
+D3U1 <- D3[D3$RNA=="U6",]
+D3U1a <- D3U1[D3U1$group %in% c("Nrde2","Nrde2d200","Nrde2D174R","Ccdc174"),]
+plotcols3a <- plotcols[c(5,5,1,1,2,2,3,3)]
+
+ggplot(D3U1a,aes(x=position,y=score,col=sample)) + geom_line() +
+   scale_color_manual(values=plotcols3a) + theme_classic() + facet_grid(group ~ RNA,scales="free") + ylim(c(0,5000))
+
+ggsave("/tungstenfs/nobackup/gbuehler/michi/Projects/Nrde2/Figures/snRNAv2_plots_BCLIP_sumU1_freescales_cpm_ylim5k_U6.pdf",device="pdf",height=16, width=16)
+
+D3U1a <- D3U1[D3U1$group %in% c("Mtr4","Eif4a3"),]
+plotcols3a <- plotcols[c(4,4,6,6)]
+plotcols3a <- plotcols[c(6,6,4,4)]
+
+ggplot(D3U1a,aes(x=position,y=score,col=sample)) + geom_line() +
+   scale_color_manual(values=plotcols3a) + theme_classic() + facet_grid(group ~ RNA,scales="free") + ylim(c(0,5000))
+
+ggsave("/tungstenfs/scratch/gbuehler/michi/Projects/Nrde2/Figures/snRNAv2_plots_BCLIP_Mtr4_Eif4a3_sumU1_freescales_ylim5k_U4.pdf",device="pdf",height=4, width=16)
+
+```
+
+
+
+
+# Plot the coverage in R for Ccdc174 WT vs Nrde2 KO and Nrde2 WT vsSmE KO
+
+```{r}
+library(tidyverse)
+library(wesanderson)
+
+setwd("/tungstenfs/scratch/gbuehler/michi/Projects/Nrde2/")
+
+files1 <- list.files("/tungstenfs/nobackup/gbuehler/michi/Projects/Nrde2/BCLIP/experiment3/longreads",full.names = TRUE, pattern="snRNAv2_snRNAv2_pileup.txt")[c(1:2,7:8)]
+files2 <- list.files("/tungstenfs/nobackup/gbuehler/michi/Projects/Nrde2/BCLIP/experiment4",full.names = TRUE, pattern="snRNAv2_snRNAv2_pileup.txt")[1:4]
+files <- c(files1,files2)
+
+filenames <- c("Ccdc174_r1","Ccdc174_r2","Nrde2_r1","Nrde2_r2",
+               "Ccdc174_Nrde2KO_r1","Ccdc174_Nrde2KO_r2","Nrde2_dTSmE_r1","Nrde2_dTSmE_r2")
+
+
+
+D <- read.table(files[1])
+D$ID <- paste(D$V1,D$V2,sep="_")
+D <- D[,c(4,1:3)]
+for (i in 2:length(filenames)){
+   D2<- read.table(files[i])
+   D2$ID <- paste(D2$V1,D2$V2,sep="_")
+   D <- full_join(D,D2[,3:4],by="ID")
+}
+colnames(D) <- c("ID","RNA","position",filenames)
+D2 <- pivot_longer(D,cols=filenames,names_to = "sample",values_to = "score")
+D2$score <- replace_na(D2$score,0)
+
+#normalize to total number of reads in fasta files
+
+#read in read counts
+read.count.files1 <- list.files("/tungstenfs/nobackup/gbuehler/michi/Projects/Nrde2/BCLIP/experiment3/longreads",full.names = TRUE, pattern="reads.txt")[c(1:2,7:8)]
+read.count.files2 <- list.files("/tungstenfs/nobackup/gbuehler/michi/Projects/Nrde2/BCLIP/experiment4",full.names = TRUE, pattern="reads.txt")[1:4]
+read.count.files <- c(read.count.files1,read.count.files2)
+
+R <- read.table(read.count.files[1])
+for (i in 2:length(read.count.files)){
+   R2<- read.table(read.count.files[i])
+   R <- rbind(R,R2)
+}
+R$sample <- filenames
+R$reads <- R$V1/2
+#calculate norm factor
+R$norm.factor <- R$reads/1000000
+
+#divide by norm factor to get cpm
+D2 <- left_join(D2,R[,3:5],by="sample")
+D2$cpm <- D2$score/D2$norm.factor
+
+```
+
+# combine U1 data
+
+```{r}
+
+#cobine U1 data
+D2$RNA <- gsub("a1","",D2$RNA)
+D2$RNA <- gsub("b1","",D2$RNA)
+D2$RNA <- gsub("b6","",D2$RNA)
+D2 <- D2 %>% group_by(RNA,position,sample) %>% summarise(score = sum(cpm))
+
+
+#combine replicates
+D3 <- D2
+D3$group <- gsub("_r1","",D3$sample)
+D3$group <- gsub("_r2","",D3$group)
+#D3$group <- gsub("_1","",D3$sample)
+#D3$group <- gsub("_2","",D3$group)
+unique(D3$group)
+
+D4 <- D3 %>% group_by(RNA,position,group) %>% summarise(gscore = mean(score))
+
+#define colors
+plotcols <- c("#046C9A","#5BBCD6","#C6CDF7","#FD6464","#F98400","#00A08A")
+plotcols3 <- plotcols[c(5,6,4,1,3,2)]
+
+ggplot(D4,aes(x=position,y=gscore,col=group)) + geom_line() +
+   scale_color_manual(values=plotcols3) + theme_classic() + facet_wrap(vars(RNA))
+
+ggsave("/tungstenfs/nobackup/gbuehler/michi/Projects/Nrde2/Figures/snRNAv2_groupwise_plots_BCLIP_Ccdc174_and_Nrde2_inKOs_sumU1_cpm.pdf",device="pdf",height=8, width=16)
+
+#split by group
+D3$group <- factor(D3$group, levels=c("Nrde2","Nrde2_dTSmE","Ccdc174","Ccdc174_Nrde2KO"), labels=c("Nrde2","Nrde2_dTSmE","Ccdc174","Ccdc174_Nrde2KO")) 
+
+
+D3 <- D3[order(D3$group),]
+plotcols3 <- plotcols[c(5,5,5,5,1,1,1,1)]
+
+ggplot(D3,aes(x=position,y=score,col=sample)) + geom_line() +
+   scale_color_manual(values=plotcols3) + theme_classic() + facet_grid(group ~ RNA,scales="free") 
+
+ggsave("/tungstenfs/nobackup/gbuehler/michi/Projects/Nrde2/Figures/snRNAv2_freefaceted_plots_BCLIP_Ccdc174_and_Nrde2_inKOs_sumU1_cpm.pdf",device="pdf",height=8, width=16)
+
+#select only U1
+D4U1 <- D4[D4$RNA=="U1",]
+D4U1a <- D4U1[D4U1$group %in% c("Nrde2","Nrde2_dTSmE"),]
+plotcols3a <- plotcols[c(1,1)]
+
+ggplot(D4U1a,aes(x=position,y=gscore,col=group,linetype=group)) + geom_line() +
+   scale_color_manual(values=plotcols3a) + theme_classic() + ylim(c(0,4500))
+
+ggsave("/tungstenfs/nobackup/gbuehler/michi/Projects/Nrde2/Figures/snRNAv2_plots_BCLIP_U1_Nrde2WTvsSmE_cpm.pdf",device="pdf",height=2, width=10)
+
+D4U1a <- D4U1[D4U1$group %in% c("Ccdc174","Ccdc174_Nrde2KO"),]
+plotcols3a <- plotcols[c(5,5)]
+
+ggplot(D4U1a,aes(x=position,y=gscore,col=group,linetype=group)) + geom_line() +
+   scale_color_manual(values=plotcols3a) + theme_classic() + ylim(c(0,20000))
+
+ggsave("/tungstenfs/nobackup/gbuehler/michi/Projects/Nrde2/Figures/snRNAv2_plots_BCLIP_U1_Ccdc174WTvsNrde2_cpm.pdf",device="pdf",height=2, width=10)
+
+```

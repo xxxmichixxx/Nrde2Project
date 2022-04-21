@@ -1,0 +1,217 @@
+---
+title: "rRNA mapping"
+output: html_notebook
+---
+
+Make bowtie2 index:
+
+```bash
+cd /tungstenfs/scratch/gbuehler/michi/Annotations/Bowtie2/BK000964_Mm_rDNA
+module load Bowtie2/2.3.5.1-GCC-8.3.0
+bowtie2-build -f BK000964_Mm_rDNA.fasta BK000964_Mm_rDNA
+```
+
+
+Map using bowtie2, using non-collapsed data, `_noComp_noLCstrip.prinseq.fasta` made from the pipeline `CRAC_pipeline_v2.sh`.
+
+```
+#cd /tungstenfs/scratch/gbuehler/michi/Projects/Nrde2/BCLIP/experiment3/longreads
+cd /tungstenfs/scratch/gbuehler/michi/Projects/Nrde2/BCLIP/experiment4
+
+module load Bowtie2
+for f in *_noComp_noLCstrip.prinseq.fasta ; do ( nice nohup bowtie2 --sensitive -f -x /tungstenfs/scratch/gbuehler/michi/Annotations/Bowtie2/BK000964_Mm_rDNA/BK000964_Mm_rDNA -S ${f%_noComp_noLCstrip.prinseq.fasta}_rDNA.sam -U $f -p 20 ) ; done
+```
+
+Only taking reads 20 bp or more, and matches with <=1 edit distance (and remove stupid @ at start of read name!):
+
+```
+for f in *_rDNA.sam ; do (cat $f | awk 'BEGIN{FS="\t"; OFS="\t"} /^@[HSP]/{print} (/NM:i:0/||/NM:i:1/){match($6,/M/); size = substr($6,1,RSTART-1); if (int(size) > 19) {print substr($0,2)}} {size = 0}' > ${f%.sam}_20ntOrLongerPerfectMatches.sam & ) ; done
+```
+
+Convert to BAM
+
+```bash
+module purge
+module load SAMtools
+for f in *_rDNA_20ntOrLongerPerfectMatches.sam ; do ( (samtools view -b $f > ${f%.sam}.bam ; samtools sort ${f%.sam}.bam > ${f%.sam}-sorted.bam ; samtools index ${f%.sam}-sorted.bam & ) & ) ; done
+```
+
+Count depth:
+
+```bash
+for f in *_rDNA_20ntOrLongerPerfectMatches-sorted.bam ; do ( nohup samtools depth -d 1000000000 -a $f > ${f%_20ntOrLongerPerfectMatches-sorted.bam}_rDNA_pileup.txt & ) ; done
+```
+
+Normalise to max depth (= 100) => max is 999.00; also pad field to width of 6, and include 2 digits after the decimal point:
+
+```
+for f in *_rDNA_pileup.txt ; do ( awk 'BEGIN{FS="\t"; OFS="\t"; maxval=0} NR==FNR&&$3>maxval{maxval=$3} NR!=FNR{$3=999*$3/maxval; printf "%s\t%i\t%6.2f\n", $1, $2, $3}' $f $f > ${f%.txt}_NormAndPadded.txt) ; done
+```
+
+# Plot the coverage in R
+
+```{r}
+library(tidyverse)
+library(wesanderson)
+
+setwd("/tungstenfs/scratch/gbuehler/michi/Projects/Nrde2/")
+
+#files <- list.files("/tungstenfs/scratch/gbuehler/michi/Projects/Nrde2/BCLIP/experiment3/longreads",full.names = TRUE, pattern="rDNA_pileup_NormAndPadded.txt")[1:12]
+#files <- list.files("/tungstenfs/scratch/gbuehler/michi/Projects/Nrde2/BCLIP/experiment3/longreads",full.names = TRUE, pattern="rDNA_pileup.txt")[1:12]
+files <- list.files("/tungstenfs/scratch/gbuehler/michi/Projects/Nrde2/BCLIP/experiment4",full.names = TRUE, pattern="rDNA_pileup.txt")
+
+
+#filenames <- c("Ccdc174_r1","Ccdc174_r2","Eif4a3_r1","Eif4a3_r2","Mtr4_r1","Mtr4_r2",
+#               "Nrde2_r1","Nrde2_r2","Nrde2D174R_r1","Nrde2D174R_r2","Nrde2d200_r1","Nrde2d200_r2")
+filenames <- c("Ccdc174_Nrde2KO_r1","Ccdc174_Nrde2KO_r2","Nrde2_dTSmE_r1","Nrde2_dTSmE_r2","Nrde2OE_r1","Nrde2OE_r2",
+               "SmE_r1","SmE_r2")
+
+
+D <- read.table(files[1])
+for (i in 2:length(files)){
+   D2<- read.table(files[i])
+   D <- cbind(D,D2[,3])
+}
+colnames(D) <- c("RNA","position",filenames)
+D2 <- pivot_longer(D,cols=filenames,names_to = "sample",values_to = "score")
+
+#remove positions > 14000 as no reads seem to map tehre anyways
+D3 <- dplyr::filter(D2,position <= 14000)
+
+#define colors
+plotcols1 <- wes_palette("Darjeeling1")
+plotcols2 <- wes_palette("Darjeeling2")
+
+plotcols <- c("#046C9A","#5BBCD6","#C6CDF7","#FD6464",  "#F98400","#00A08A")
+plotcols3 <- plotcols[c(5,5,6,6,4,4,1,1,3,3,2,2)]
+
+ggplot(D3,aes(x=position,y=score,col=sample)) + geom_line() +
+   scale_color_manual(values=plotcols3) + theme_classic()
+
+#ggsave("/tungstenfs/scratch/gbuehler/michi/Projects/Nrde2/Figures/BK000964_Mm_rDNA_plots_BCLIP.pdf",device="pdf",height=8, width=20)
+ggsave("/tungstenfs/scratch/gbuehler/michi/Projects/Nrde2/Figures/BK000964_Mm_rDNA_plots_BCLIP_exp4.pdf",device="pdf",height=8, width=20)
+
+#combine replicates
+D3$group <- gsub("_r1","",D3$sample)
+D3$group <- gsub("_r2","",D3$group)
+unique(D3$group)
+
+D4 <- D3 %>% group_by(position,group) %>% summarise(gscore = mean(score))
+
+plotcols3 <- plotcols[c(5,6,4,1,3,2)]
+ggplot(D4,aes(x=position,y=gscore,col=group)) + geom_line() +
+   scale_color_manual(values=plotcols3) + theme_classic()
+
+#ggsave("/tungstenfs/scratch/gbuehler/michi/Projects/Nrde2/Figures/BK000964_Mm_rDNA_groupwise_plots_BCLIP.pdf",device="pdf",height=4, width=10)
+ggsave("/tungstenfs/scratch/gbuehler/michi/Projects/Nrde2/Figures/BK000964_Mm_rDNA_groupwise_plots_BCLIP_exp4.pdf",device="pdf",height=4, width=10)
+
+#split by group
+D3$group <- factor(D3$group, levels=c("Nrde2","Nrde2d200","Nrde2D174R","Mtr4","Ccdc174","Eif4a3"), labels=c("Nrde2","Nrde2d200","Nrde2D174R","Mtr4","Ccdc174","Eif4a3")) 
+D3 <- D3[order(D3$group),]
+plotcols3 <- plotcols[c(5,5,6,6,4,4,1,1,3,3,2,2)]
+
+ggplot(D3,aes(x=position,y=score,col=sample)) + geom_line() +
+   scale_color_manual(values=plotcols3) + theme_classic() + facet_grid(group ~ .) 
+
+ggsave("/tungstenfs/scratch/gbuehler/michi/Projects/Nrde2/Figures/BK000964_Mm_rDNA_faceted_plots_BCLIP.pdf",device="pdf",height=8, width=8)
+
+```
+
+## count the number of reads on the rDNA
+
+```{r}
+library(Rsubread)
+
+#counts reads mapping to rRNAs
+files <- list.files("/tungstenfs/scratch/gbuehler/michi/Projects/Nrde2/BCLIP/experiment3/longreads",full.names = TRUE, pattern="_rDNA_20ntOrLongerPerfectMatches-sorted.bam$")[1:12]
+#files <- list.files("/tungstenfs/scratch/gbuehler/michi/Projects/Nrde2/BCLIP/experiment4",full.names = TRUE, pattern="_rDNA_20ntOrLongerPerfectMatches-sorted.bam$")
+
+filenames <- c("Ccdc174_r1","Ccdc174_r2","Eif4a3_r1","Eif4a3_r2","Mtr4_r1","Mtr4_r2",
+              "Nrde2_r1","Nrde2_r2","Nrde2D174R_r1","Nrde2D174R_r2","Nrde2d200_r1","Nrde2d200_r2")
+
+saf <- data.frame(GeneID="BK000964_Mm_rDNA",Chr="BK000964_Mm_rDNA",Start=1,End=45306,Strand="+")
+
+counts <- featureCounts(files, annot.ext = saf,allowMultiOverlap = TRUE,countMultiMappingReads = TRUE,strandSpecific = 1,nthreads = 2)
+counts1 <- counts$counts
+colnames(counts1) <- filenames
+
+#counts reads mapping to protein coding genes
+library(GenomicFeatures)
+library(EnsDb.Mmusculus.v79)
+edb <- EnsDb.Mmusculus.v79
+txtypes <- genes(edb, columns=c("gene_name", "gene_biotype", "tx_biotype", "tx_id"))
+head(txtypes)
+genes <- txtypes[txtypes$gene_biotype=="protein_coding"]
+saf <- data.frame(GeneID=names(genes),Chr=seqnames(genes),Start=start(genes),End=end(genes),Strand=strand(genes))
+files <- c(list.files("/tungstenfs/scratch/gbuehler/flemrmat/data/2456/raw_data/", full.names=TRUE,pattern="*LCstripped.prinseq_Aligned.sortedByCoord.out.bam$"))[1:12]
+
+counts <- featureCounts(files, annot.ext = saf,allowMultiOverlap = TRUE,countMultiMappingReads = TRUE,strandSpecific = 1,nthreads = 2)
+counts2 <- counts$counts
+colnames(counts2) <- filenames
+counts2sums <- colSums(counts2)
+
+counts <- data.frame(rbind(counts1,counts2sums))
+counts$ID <- c("rDNA","protein_coding")
+
+write.table(counts,file="/tungstenfs/scratch/gbuehler/michi/Projects/Nrde2/FigureData/rRNA_and_proteincoding_read_counts.txt",sep="\t",row.names=FALSE,col.names=TRUE,append=FALSE,quote=FALSE)
+#write.table(count2,file="/tungstenfs/scratch/gbuehler/michi/Projects/Nrde2/FigureData/snRNA_read_counts_exp2743.txt",sep="\t",row.names=FALSE,col.names=TRUE,append=FALSE,quote=FALSE)
+
+```
+
+## count the number of reads on the rDNA, exons, rest of the genome
+
+Map to rDNA using bowtie2, using non-collapsed data, `_noComp_noLCstrip.prinseq.fasta` made from the pipeline `CRAC_pipeline_v2.sh`.
+
+```bash
+cd /tungstenfs/scratch/gbuehler/michi/Projects/Nrde2/BCLIP/experiment3/longreads
+module load Bowtie2
+for f in *_noComp_noLCstrip.prinseq.fasta ; do ( nice nohup bowtie2 --sensitive -f -x /tungstenfs/scratch/gbuehler/michi/Annotations/Bowtie2/BK000964_Mm_rDNA/BK000964_Mm_rDNA -S ${f%_noComp_noLCstrip.prinseq.fasta}_rDNA.sam -U $f -p 20 --un ${f%_noComp_noLCstrip.prinseq.fasta}_non_rDNA.fasta ) ; done
+```
+
+Take unmapped reads and map them to transcriptome
+
+```bash
+#make index
+cd /tungstenfs/scratch/gbuehler/michi/Annotations/Bowtie2/gencode.vM23.pc_transcripts
+module load Bowtie2
+bowtie2-build -f gencode.vM23.pc_transcripts.fa.gz gencode.vM23.pc_transcripts
+```
+
+```bash
+for f in *_non_rDNA.fasta ; do ( nice nohup bowtie2 --sensitive -f -x /tungstenfs/scratch/gbuehler/michi/Annotations/Bowtie2/gencode.vM23.pc_transcripts/gencode.vM23.pc_transcripts -S ${f%_non_rDNA.fasta}_pc_transcriptome.sam -U $f -p 20 --un ${f%_non_rDNA.fasta}_non_rDNA_nonpcTR.fasta ) ; done
+```
+
+Take unmapped reads and map them to genome
+
+```bash
+for f in *_non_rDNA_nonpcTR.fasta ; do ( nice nohup bowtie2 --sensitive -f -x /work/gbioinfo/DB/genomes/mm10/bowtie2Index_BSgenome.Mmusculus.mm10/bowtie2Index -S ${f%_non_rDNA_nonpcTR.fasta}_genome.sam -U $f -p 20 --un ${f%_non_rDNA_nonpcTR.fasta}_non_rDNA_nonpcTR_nonGenome.fasta ) ; done
+```
+
+Convert to BAM and index
+
+```bash
+module purge
+module load SAMtools
+for f in *.sam ; do ( (samtools view -b $f > ${f%.sam}.bam ; samtools sort ${f%.sam}.bam > ${f%.sam}-sorted.bam ; samtools index ${f%.sam}-sorted.bam & ) & ) ; done
+```
+
+Count mapped reads
+
+```bash
+#rm rDNA_read_counts.txt
+echo rDNA_read_counts.txt
+echo pc_transcriptome_read_counts.txt
+echo genome_read_counts.txt
+echo unmapped_read_counts.txt
+
+for sample in 2456_BCLIP_Eif4a3_1 2456_BCLIP_Eif4a3_2 2456_BCLIP_Mtr4_1 2456_BCLIP_Mtr4_2 2456_BCLIP_Nrde2_1 2456_BCLIP_Nrde2_2 2456_BCLIP_Nrde2d200_1 2456_BCLIP_Nrde2d200_2 2456_BCLIP_Nrde2D174R_1 2456_BCLIP_Nrde2D174R_2 2456_BCLIP_Ccdc174_1 2456_BCLIP_Ccdc174_2
+do
+samtools flagstat ${sample}_rDNA-sorted.bam | grep "mapped (" >> rDNA_read_counts.txt
+samtools flagstat ${sample}_pc_transcriptome-sorted.bam | grep "mapped (" >> pc_transcriptome_read_counts.txt
+samtools flagstat ${sample}_genome-sorted.bam | grep "mapped (" >> genome_read_counts.txt
+wc -l ${sample}_non_rDNA_nonpcTR_nonGenome.fasta >> unmapped_read_counts.txt
+done
+
+```
+
+
